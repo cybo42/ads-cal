@@ -48,6 +48,7 @@ A small, fast, offline-first mobile app that lets an attendee:
 - G5 — Optional cross-device sync of favorites and reminder settings.
 - G6 — Works fully offline after first sign-in and agenda download.
 - G7 — Shared business logic and UI across Android and iOS via KMP + Compose Multiplatform.
+- *Stretch* G8 — Cloud-hosted agenda service with pushed updates (§4.9), reusing the v1 ingestion code.
 
 ### 2.2 Non-goals (v1)
 - Ticketing, RSVP, or badge management.
@@ -203,6 +204,45 @@ App ─► GET manifest.json (tiny) ─► hash changed? ─► GET agenda.json 
 | FR-DATA-10 | `schemaVersion` is checked by the app; a newer major version is ignored, the app keeps current data and shows an "update the app" hint. Publish old major versions side-by-side (`v1/agenda.json`) when the schema breaks. | P1 |
 | FR-DATA-11 | Emergency fallback: a hand-edited `agenda.override.json` in the repo, merged by the pipeline, to patch or replace data if the source breaks during the event. | P2 |
 
+### 4.9 FR-CL — Cloud agenda service (stretch goal)
+
+**Goal:** replace the GitHub Actions cron and GitHub Pages hosting with a cloud service that does three things: fetches and parses the schedule on demand or on a schedule, stores it in the cloud, and **tells apps when an update exists** instead of waiting for them to poll. This is beyond v1. It ships only if M1–M3 finish early, or if event-week freshness turns out to need it.
+
+What it adds over the v1 pipeline:
+- updates reach apps in seconds rather than at the next poll;
+- apps can be woken in the background when a favorited session changes;
+- an authenticated "refresh now" endpoint;
+- no dependency on GitHub Pages.
+
+**No duplicate work.** The cloud service is a second *host* for the v1 pipeline, not a second pipeline:
+
+| Concern | v1 (FR-DATA) | Cloud service (FR-CL) | Shared code |
+|---|---|---|---|
+| Fetch RPC + headless fallback | `:tools:agenda-ingest` | same library | ✅ |
+| Parse positional payload → DTOs | `RsvpAgendaParser` | same | ✅ |
+| Validation gate, thumbnails, `contentHash` | `:tools:agenda-ingest` | same | ✅ |
+| Published schema (`manifest.json`, `agenda.json`) | `:shared:core-model` serializers | same files, same schema | ✅ |
+| Where it runs | GitHub Actions cron (`:tools:agenda-sync` CLI) | Cloud Run + Cloud Scheduler (`:server:agenda-service`) | thin entry points only |
+| Where it stores | GitHub Pages | Cloud Storage + Firestore meta doc | `AgendaPublisher` interface, 2 implementations |
+| App reads | `PublishedAgendaSource` | **same class, different base URL** | ✅ |
+| Update signal | app polls the manifest | Firestore listener / FCM topic (new) | new, small |
+
+The only new code is: the HTTP/scheduler entry point, the `CloudStoragePublisher`, the update-signal emitters, and the app-side listener that triggers the **existing** refresh path (FR-DATA-7). **Only one writer is active at a time.** When the cloud service is live, the GitHub workflow switches to `--dry-run` validation and stays as a cold standby.
+
+| ID | Requirement | Priority |
+|---|---|---|
+| FR-CL-1 | **Prerequisite (in v1 scope):** build the v1 pipeline as the library `:tools:agenda-ingest` (fetch, parse, validate, thumbnail, `AgendaPublisher` interface) plus the thin CLI `:tools:agenda-sync`. The cloud service must not need to refactor or copy pipeline code. | P0 (v1) |
+| FR-CL-2 | `:server:agenda-service`: a Kotlin/JVM container (Ktor) on **Cloud Run** in the existing Firebase/GCP project, with Chrome in the image for the fallback path. Cloud Scheduler calls it on the FR-DATA-6 cadence. | P2 |
+| FR-CL-3 | **Storage:** `CloudStoragePublisher` writes the same `manifest.json`, `agenda.json`, and `img/*` to a public-read GCS bucket, fronted by Firebase Hosting/CDN with `ETag` and a short `max-age`. Raw RPC snapshots go to a private bucket, keyed by `contentHash`, as history. | P2 |
+| FR-CL-4 | **HTTP API** (read-only, public, cacheable): `GET /v1/manifest`, `GET /v1/agenda` (`If-None-Match` → 304), `GET /v1/img/{id}.webp`. Optional: `GET /v1/changes?since={contentHash}` returns a session-level delta (added/removed/changed IDs and fields), computed with the same diff code as FR-DATA-9. | P2 |
+| FR-CL-5 | **Admin API:** `POST /v1/admin/refresh` triggers an immediate fetch, parse, and publish. It is protected by IAM (OIDC from Cloud Scheduler or an allow-listed Google account) and is never callable from the app. `POST /v1/admin/override` uploads an `agenda.override.json` (FR-DATA-11). | P2 |
+| FR-CL-6 | **Update signal:** when `contentHash` changes, (a) write `public/agendaMeta` in Firestore `{schemaVersion, contentHash, generatedAt}`, and (b) send an FCM **data** message to topic `agenda-updates` with the same fields and the changed session IDs (capped at 50). | P2 |
+| FR-CL-7 | **App: foreground updates.** If the cloud source is enabled, listen to `public/agendaMeta` while the app is in the foreground. Reuses the Firestore SDK already used by FR-SY and works even with sync off. A hash change triggers the existing FR-DATA-7 refresh. | P2 |
+| FR-CL-8 | **App: background updates.** Subscribe to the FCM topic `agenda-updates`. On a data message, schedule a background refresh (Android WorkManager / iOS `BGAppRefreshTask` or silent push). If a changed ID is a favorite, the FR-DATA-9 notice and FR-RM-4 reminder reconciliation run even if the app wasn't opened. | P2 |
+| FR-CL-9 | **Source switch:** the agenda base URL comes from Firebase Remote Config (default: GitHub Pages). Flipping it needs no app release, and either host serves identical files. | P2 |
+| FR-CL-10 | **Security and cost:** Firestore rules make `public/agendaMeta` read-only for signed-in users and writable only by the service account. Cloud Run scales from min 0 to max 2 instances. Budget alert at $5/month. Expected cost is within free tiers (< 100 runs/day, tiny egress behind CDN). | P2 |
+| FR-CL-11 | **Observability:** structured logs per run (duration, path direct/fallback, validation result, hash changed?). Alert on 3 consecutive failures or a validation reject. Expose `GET /v1/health` with the last successful run. | P2 |
+
 ### 4.8 FR-ST — Settings and account
 
 | ID | Requirement | Priority |
@@ -291,7 +331,9 @@ data class TimeSlot(val start: Instant, val sessions: List<Session>, val paralle
 |---|---|---|
 | `:shared:core-model` | Domain models, IDs, value types | common |
 | `:shared:data-agenda` | `AgendaSource` implementations (`BundledAgendaSource`, `PublishedAgendaSource` reading our `manifest.json`/`agenda.json`), refresh policy, diff. **No knowledge of the Google RPC format.** | common (Ktor engines per platform) |
-| `:tools:agenda-sync` | JVM CLI run by GitHub Actions: RPC fetch (+ Playwright fallback), `RsvpAgendaParser`, validation, image thumbnailing, publish artifacts. Reuses `:shared:core-model` serializers so the published schema and app DTOs can't drift. Not shipped in the app. | JVM |
+| `:tools:agenda-ingest` | JVM library: RPC fetch (+ Playwright fallback), `RsvpAgendaParser`, validation, image thumbnailing, diff, `AgendaPublisher` interface. Reuses `:shared:core-model` serializers so the published schema and app DTOs can't drift. Not shipped in the app. | JVM |
+| `:tools:agenda-sync` | Thin CLI over `:tools:agenda-ingest` with `GitHubPagesPublisher`; run by GitHub Actions. | JVM |
+| `:server:agenda-service` *(stretch, FR-CL)* | Thin Ktor/Cloud Run entry point over `:tools:agenda-ingest` with `CloudStoragePublisher`, admin API, Firestore/FCM update signal. | JVM |
 | `:shared:data-local` | SQLDelight schema, DAOs, repositories (`AgendaRepository`, `FavoritesRepository`, `PrefsRepository`) | common + driver `actual`s |
 | `:shared:domain` | Overlap engine, time-slot grouping, filter/search, use cases (`ToggleFavorite`, `ObserveDay`, `ObserveMySchedule`, `ReconcileReminders`) | common, pure Kotlin |
 | `:shared:auth` | `AuthRepository` interface + Firebase implementation (GitLive), fake for tests | common + platform sign-in bridges |
@@ -379,7 +421,7 @@ flowchart TD
 - **Acceptance:** `./gradlew check` passes locally and in CI; iOS app builds from Xcode and CI.
 
 ### WS1 — Agenda data and ingestion · Size M–L
-- **Scope (pipeline):** `:tools:agenda-sync` — RPC fetcher + Playwright fallback, `RsvpAgendaParser` with golden tests on committed raw snapshots, validation gate, thumbnailing, GitHub Pages publish, cron workflow, failure → GitHub issue (FR-DATA-2..6, 11).
+- **Scope (pipeline):** `:tools:agenda-ingest` library + `:tools:agenda-sync` CLI (FR-CL-1 split, so WS8 can reuse it) — RPC fetcher + Playwright fallback, `RsvpAgendaParser` with golden tests on committed raw snapshots, validation gate, thumbnailing, GitHub Pages publish, cron workflow, failure → GitHub issue (FR-DATA-2..6, 11).
 - **Scope (app):** `core-model` serializable DTOs; `BundledAgendaSource` + `syncBundledAgenda` Gradle task; `PublishedAgendaSource` (manifest → conditional fetch); SQLDelight agenda tables; `AgendaRepository` exposing `Flow<List<ConferenceDay>>`; refresh policy; diffing (FR-DATA-7..10).
 - **Depends on:** WS0. The pipeline half can start on day 1 — the source is now known and a raw snapshot exists.
 - **Acceptance:** CI job publishes a valid `agenda.json` from the live source; a deliberately corrupted fixture fails validation and does not publish; fresh install with no network shows the full agenda from the bundle; a refresh with a changed hash updates the DB in one transaction and emits a diff; an unchanged hash costs one small manifest request; parser tests cover time zone, missing fields (breaks have no speakers/code), inconsistent track names, and ID stability.
@@ -419,6 +461,11 @@ flowchart TD
 - **Depends on:** WS3, WS5 (and WS6 if shipped).
 - **Acceptance:** NFR targets in §5 met; builds available to testers on both stores at least **2 weeks before the event**.
 
+### WS8 — Cloud agenda service (stretch) · Size M
+- **Scope:** FR-CL-2..11 — `:server:agenda-service` container and deploy (Cloud Run, Scheduler, GCS bucket, Hosting rewrites), `CloudStoragePublisher`, read and admin APIs, Firestore `public/agendaMeta` + rules, FCM topic sender; app-side Remote Config source switch, foreground Firestore listener, FCM background refresh. No parser, validation, schema, or `AgendaSource` work. Those come from WS1 unchanged.
+- **Depends on:** WS1 (with the FR-CL-1 library split), WS-AUTH (Firebase project), WS5 (reminder reconciliation on background refresh).
+- **Acceptance:** `agenda-service` and `agenda-sync --dry-run` produce byte-identical `agenda.json` from the same raw snapshot; a source change reaches a foregrounded app in < 30 s and a backgrounded app (FCM delivered) in < 5 min; flipping Remote Config between GitHub Pages and the cloud host needs no app release; admin refresh rejects unauthenticated calls; GitHub workflow in standby never publishes while the cloud is the active writer.
+
 ### Milestones
 
 | Milestone | Contents | Exit criteria |
@@ -426,6 +473,7 @@ flowchart TD
 | **M1 — Browse** | WS0, WS1, WS2, WS3 (agenda screens), WS-AUTH | Signed-in user can browse every day offline with overlaps shown |
 | **M2 — Plan** | WS4, WS5, WS3 (My Schedule, Settings) | Favorites, conflict view, and reliable reminders on both platforms |
 | **M3 — Sync & ship** | WS6, WS7 | Optional sync behind a toggle; store builds released to testers |
+| **M4 — Cloud agenda (stretch)** | WS8 | Cloud service is the active writer; apps get pushed agenda updates; GitHub pipeline on standby |
 
 Parallelism: once WS0 is done, **WS1, WS2, WS3, and WS-AUTH can run at the same time** (4 streams). WS4 → WS5 and WS6 can then split across two people.
 
@@ -460,6 +508,7 @@ Parallelism: once WS0 is done, **WS1, WS2, WS3, and WS-AUTH can run at the same 
 |---|---|---|---|
 | R1 | **Agenda source is a private, undocumented Google RPC** (positional arrays, API key from the JS bundle, build-label versioned). It can change without notice, and the terms of use are not stated. | High (likelihood reduced: format now known) | Only our CI talks to it (ADR-0001); Playwright fallback; validation gate before publish; golden fixtures; bundled snapshot; `agenda.override.json` manual patch; ask organizers for an official feed. |
 | R1b | Source has no rooms, levels, or speaker bios; track names are inconsistent free text. | Low | UI degrades gracefully (track as lane); resolve tracks by tag ID; render optional fields only when present. |
+| R1d | Stretch cloud service diverges from, or races with, the GitHub pipeline (two writers, two parsers). | Medium | FR-CL-1 shared library; byte-identical output test; single active writer with the other in `--dry-run`. |
 | R1c | Speaker photos are huge (up to 5.5 MB, ~25 MB total). | Medium (app size, cold start) | Pipeline resizes to 256 px WebP (~15 KB each); app never loads originals. |
 | R2 | Late agenda changes during the event week | Medium | Refresh policy + diff notices; reminders reconciled on every refresh. |
 | R3 | Android exact-alarm restrictions (API 31+/34+) | Medium | `USE_EXACT_ALARM` is allowed for calendar/alarm-style apps; otherwise request `SCHEDULE_EXACT_ALARM` with an explanation; inexact fallback. |
@@ -487,3 +536,4 @@ Parallelism: once WS0 is done, **WS1, WS2, WS3, and WS-AUTH can run at the same 
 | Reminder alert before a session | FR-RM-1..10 | WS5 |
 | Optional cross-device sync | FR-SY-1..10 (+ FR-AU) | WS-AUTH, WS6 |
 | Authentication via Firebase Auth | FR-AU-1..8 | WS-AUTH |
+| *(Stretch)* Cloud fetch/parse/store with pushed updates | FR-CL-1..11 | WS1 (library split), WS8 |
