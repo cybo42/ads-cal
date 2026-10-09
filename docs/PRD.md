@@ -2,9 +2,9 @@
 
 | | |
 |---|---|
-| **Status** | Draft v0.1 |
+| **Status** | Draft v0.2 (agenda source spike done — see [ADR-0001](adr/0001-agenda-source.md)) |
 | **Owner** | cybo42 |
-| **Last updated** | 2026-10-07 |
+| **Last updated** | 2026-10-09 |
 | **Platforms** | Android, iOS (Compose Multiplatform); Desktop JVM as stretch/dev target |
 | **References** | [Kotlin Multiplatform](https://kotlinlang.org/multiplatform/) · [ADS Bayview agenda](https://rsvp.withgoogle.com/events/android-dev-summit-bayview/agenda) |
 
@@ -94,10 +94,10 @@ Priority: **P0** = must ship for v1, **P1** = should ship, **P2** = nice to have
 |---|---|---|
 | FR-AG-1 | Show one tab per conference day, labeled with weekday and date. Default to "today" during the event, otherwise Day 1. | P0 |
 | FR-AG-2 | Within a day, list sessions in chronological order, **grouped into time-slot sections** by start time. | P0 |
-| FR-AG-3 | Session card shows title, start–end time, room, speaker name(s), track/tag chips, format (talk, workshop, keynote, lightning, break), and favorite toggle. | P0 |
-| FR-AG-4 | Tapping a card opens Session Detail: full description, speakers (name, title, company, photo if available), room, tags, level, links (livestream/recording if provided), favorite toggle, and reminder override. | P0 |
+| FR-AG-3 | Session card shows title, start–end time, track chip (the source has **no room field**; the 4 tracks are the parallel lanes), speaker name(s), format (talk, workshop, keynote, AMA, hackathon, break), and favorite toggle. Room is shown only if the source adds it later. | P0 |
+| FR-AG-4 | Tapping a card opens Session Detail: full description (sanitized HTML → rich text), session code (e.g. `ADS26_035`), speakers (name, title, company, photo, social links — the source has no bios), track, links, favorite toggle, reminder override, and a "Reserve on official site" link-out. | P0 |
 | FR-AG-5 | Times shown in **venue time zone (America/Los_Angeles)** by default, with a setting to show device-local time. The time zone in use is always labeled. | P0 |
-| FR-AG-6 | Filter sheet: track, room, format, level, favorites only. Active filters shown as removable chips; filter state kept per session of use. | P1 |
+| FR-AG-6 | Filter sheet: track, format, favorites only (room and level only if the source provides them). Active filters shown as removable chips; filter state kept per session of use. | P1 |
 | FR-AG-7 | Search across title, description, speaker name, and tags; results grouped by day. | P1 |
 | FR-AG-8 | "Now" / "Up next" indicator during the event; auto-scroll to the current time slot when opening today's tab. | P1 |
 | FR-AG-9 | Pull-to-refresh triggers an agenda refresh (see FR-DATA). | P1 |
@@ -173,14 +173,35 @@ Priority: **P0** = must ship for v1, **P1** = should ship, **P2** = nice to have
 
 ### 4.7 FR-DATA — Agenda ingestion
 
+**Source (spike result, [ADR-0001](adr/0001-agenda-source.md)):** the official agenda page is a client-rendered Google "Boq/Wiz" app with no data in the HTML. All agenda data comes from one unauthenticated RPC, `POST rsvp.withgoogle.com/_/Rsvpguest/data/batchexecute?rpcids=NdS7Dc`, with `f.req=[[["NdS7Dc","[\"engagements/android-dev-summit-bayview\"]",null,"generic"]]]`. It needs `X-Same-Domain: 1` and an `x-goog-ext-63847900-jspb` header that carries the site's public web API key, which is loaded from the JS bundle. The response is `)]}'`-prefixed, length-chunked JSON. The inner payload is **positional arrays with no field names**. The response has `Cache-Control: no-store` and no ETag.
+
+**Decision:** mobile clients **never** call the Google RPC. A **pipeline we own** fetches, parses, validates, and publishes a normalized `agenda.json`. The app reads only that file, plus a copy bundled at build time.
+
+Reasons: the RPC is undocumented and private, and it could change at any time. Shipping a borrowed API key inside the app is inappropriate. Parsing positional arrays is brittle, so a format change should break **one CI job we can fix in minutes**, not every installed app until a store release.
+
+```
+GitHub Action (cron) ─► :tools:agenda-sync (JVM CLI) ─► validate ─► publish
+   fetch RPC (curl-style)          parse positional         schema +    gh-pages: manifest.json,
+   └ fallback: headless Chrome     arrays → core-model      sanity      agenda.json, img/*.webp
+     capture of NdS7Dc response    DTOs                     checks      + raw snapshot committed
+                                                                         to repo (history/diff)
+App ─► GET manifest.json (tiny) ─► hash changed? ─► GET agenda.json ─► SQLDelight txn ─► diff
+ └ first launch / offline: bundled agenda.json + thumbnails from composeResources
+```
+
 | ID | Requirement | Priority |
 |---|---|---|
-| FR-DATA-1 | **Source investigation (spike):** work out how the official agenda page loads its data (embedded JSON, XHR/JSON endpoint, or server-rendered HTML) and check terms of use. Output: a short ADR choosing the source adapter. | P0 |
-| FR-DATA-2 | Pluggable `AgendaSource` interface with implementations: `BundledAgendaSource` (JSON snapshot shipped in app resources), `RemoteJsonAgendaSource`, and if needed `HtmlScrapeAgendaSource` or a self-hosted mirror (e.g. a JSON file in this repo / GitHub Pages, refreshed by a scheduled GitHub Action). | P0 |
-| FR-DATA-3 | Normalizer maps source DTOs into the internal model (§6), parses times as `Instant` using the venue time zone, and builds stable IDs (upstream ID, or a hash of title+start if none). | P0 |
-| FR-DATA-4 | Refresh policy: on app start (if last refresh > 1 h), on pull-to-refresh, and on background refresh during event days; uses ETag/`If-Modified-Since` where available. Failures keep the last good data and never wipe it. | P0 |
-| FR-DATA-5 | Diff old vs new agenda; for favorited sessions with time/room changes or removals, raise an in-app notice (and a local notification if the change is within 24 h of the session). | P1 |
-| FR-DATA-6 | Agenda schema version stored; incompatible remote data is rejected and logged. | P1 |
+| FR-DATA-1 | ~~Source spike~~ **Done** — see ADR-0001. Remaining: confirm the terms of use and get informal OK from the ADS/DevRel organizers if possible. Note that the page sends `robots: noindex` and has no robots.txt. | P0 |
+| FR-DATA-2 | **Fetcher** (`:tools:agenda-sync`, JVM, runs in GitHub Actions on Linux): calls the `NdS7Dc` RPC directly with Ktor/OkHttp. The API key and the `engagements/…` slug are config, not code. **Fallback:** if the call fails or the payload doesn't validate, launch headless Chrome (Playwright), load the agenda page, and capture the `NdS7Dc` response from the network log. This also recovers a rotated API key. The same parser handles both paths. | P0 |
+| FR-DATA-3 | **Parser:** a single `RsvpAgendaParser` decodes the envelope (strip `)]}'`, find the `wrb.fr`/`NdS7Dc` chunk, parse the inner JSON string) and maps positional indices into `core-model` DTOs. **All index constants live in one file** (see ADR-0001 field map). Times are epoch seconds plus the IANA zone from the payload, stored as `Instant`. IDs are the upstream resource UUIDs (`…/sessions/{uuid}`), which are stable. The slug and the `ADS26_xxx` code are kept as secondary keys. Tracks are resolved via **tag IDs** (field 40 → tag table), not the free-text track names, which are inconsistent (`Apps foundation` vs `Apps Foundation`). Description HTML is sanitized to a small allow-list. | P0 |
+| FR-DATA-4 | **Validation gate** (a failure blocks publishing and opens a GitHub issue): schema decodes; sessions ≥ 80 % of the last published count; every session has `start < end` and falls within event dates; every referenced speaker and tag resolves; no duplicate IDs. Golden-file tests run against committed raw snapshots. | P0 |
+| FR-DATA-5 | **Publish** to GitHub Pages: `manifest.json` (`schemaVersion`, `contentHash` = SHA-256 of canonical `agenda.json`, `generatedAt`, `sourceLastModified` from the site-version timestamp), `agenda.json` (~60 KB, gzip ~12 KB), and speaker thumbnails resized to 256 px WebP (the originals total ~25 MB, up to 5.5 MB each). Commit the raw RPC snapshot and `agenda.json` to a `data/` branch **only when the hash changes**, so git history is the change log. | P0 |
+| FR-DATA-6 | **Schedule:** cron every 6 h until 7 days before the event, hourly during event week, and every 15 min on Oct 28–29 (America/Los_Angeles). Manual `workflow_dispatch` is available for urgent fixes. | P0 |
+| FR-DATA-7 | **App refresh policy:** on app start (if last check > 1 h, or > 10 min on event days), on pull-to-refresh, and on background refresh during event days. Fetch `manifest.json` first and download `agenda.json` only if `contentHash` differs (GitHub Pages also returns ETag, so use `If-None-Match`). Apply the new data in one SQLDelight transaction. Failures keep the last good data and never wipe it. | P0 |
+| FR-DATA-8 | **Bundled snapshot:** a Gradle task (`syncBundledAgenda`) pulls the latest published `agenda.json` and thumbnails into `composeResources` at build time. Release builds pin the snapshot hash in `BuildConfig` for traceability. | P0 |
+| FR-DATA-9 | Diff old vs new agenda; for favorited sessions with time/track changes or removals, raise an in-app notice (and a local notification if the change is within 24 h of the session). | P1 |
+| FR-DATA-10 | `schemaVersion` is checked by the app; a newer major version is ignored, the app keeps current data and shows an "update the app" hint. Publish old major versions side-by-side (`v1/agenda.json`) when the schema breaks. | P1 |
+| FR-DATA-11 | Emergency fallback: a hand-edited `agenda.override.json` in the repo, merged by the pipeline, to patch or replace data if the source breaks during the event. | P2 |
 
 ### 4.8 FR-ST — Settings and account
 
@@ -216,23 +237,26 @@ Priority: **P0** = must ship for v1, **P1** = should ship, **P2** = nice to have
 ## 6. Data model
 
 ```kotlin
-// :shared:core-model
+// :shared:core-model — @Serializable; also the published agenda.json schema
 data class Session(
-    val id: SessionId,
+    val id: SessionId,              // upstream UUID from "events/{e}/sessions/{uuid}"
+    val slug: String,               // e.g. "ai-session-006"
+    val code: String?,              // e.g. "ADS26_035"; null for breaks
     val title: String,
-    val description: String,
+    val descriptionHtml: String,    // sanitized allow-list HTML
     val start: Instant,
     val end: Instant,
-    val roomId: RoomId?,
-    val trackIds: List<TrackId>,
+    val timeZone: String,           // from source, "America/Los_Angeles"
+    val roomId: RoomId?,            // not provided by source today
+    val trackIds: List<TrackId>,    // resolved from tag IDs
     val speakerIds: List<SpeakerId>,
-    val format: SessionFormat,      // KEYNOTE, TALK, WORKSHOP, LIGHTNING, PANEL, BREAK, OTHER
-    val level: SessionLevel?,       // INTRO, INTERMEDIATE, ADVANCED
-    val tags: List<String>,
-    val links: List<Link>,          // livestream, recording, slides
+    val format: SessionFormat,      // derived: KEYNOTE, TALK, WORKSHOP, AMA, HACKATHON, BREAK, OTHER
+    val level: SessionLevel?,       // not provided by source today
+    val links: List<Link>,          // official session page / reservation link-out
 )
 
-data class Speaker(val id: SpeakerId, val name: String, val title: String?, val company: String?, val photoUrl: String?, val bio: String?)
+data class Speaker(val id: SpeakerId, val firstName: String, val lastName: String?, val title: String?, val company: String?, val photo: String?, val links: List<Link>) // no bio in source; photo = bundled/published thumbnail path
+data class AgendaManifest(val schemaVersion: Int, val contentHash: String, val generatedAt: Instant, val sourceLastModified: Instant?)
 data class Room(val id: RoomId, val name: String, val floor: String?)
 data class Track(val id: TrackId, val name: String, val color: String?)
 data class ConferenceDay(val date: LocalDate, val sessions: List<Session>)
@@ -255,7 +279,7 @@ data class Overlap(val a: SessionId, val b: SessionId, val minutes: Int)
 data class TimeSlot(val start: Instant, val sessions: List<Session>, val parallelCount: Int)
 ```
 
-**Local DB (SQLDelight) tables:** `session`, `speaker`, `session_speaker`, `room`, `track`, `session_track`, `agenda_meta` (version, etag, lastRefreshed), `favorite`, `user_prefs`, `acknowledged_conflict`, `sync_outbox`, `scheduled_reminder` (sessionId, triggerAt, platformRequestId — used for reconciliation).
+**Local DB (SQLDelight) tables:** `session`, `speaker`, `session_speaker`, `room`, `track`, `session_track`, `agenda_meta` (schemaVersion, contentHash, manifestEtag, sourceLastModified, lastChecked, lastApplied), `favorite`, `user_prefs`, `acknowledged_conflict`, `sync_outbox`, `scheduled_reminder` (sessionId, triggerAt, platformRequestId — used for reconciliation).
 
 ---
 
@@ -266,7 +290,8 @@ data class TimeSlot(val start: Instant, val sessions: List<Session>, val paralle
 | Module | Responsibility | Platforms |
 |---|---|---|
 | `:shared:core-model` | Domain models, IDs, value types | common |
-| `:shared:data-agenda` | `AgendaSource` implementations, DTOs, normalizer, refresh/diff | common (Ktor engines per platform) |
+| `:shared:data-agenda` | `AgendaSource` implementations (`BundledAgendaSource`, `PublishedAgendaSource` reading our `manifest.json`/`agenda.json`), refresh policy, diff. **No knowledge of the Google RPC format.** | common (Ktor engines per platform) |
+| `:tools:agenda-sync` | JVM CLI run by GitHub Actions: RPC fetch (+ Playwright fallback), `RsvpAgendaParser`, validation, image thumbnailing, publish artifacts. Reuses `:shared:core-model` serializers so the published schema and app DTOs can't drift. Not shipped in the app. | JVM |
 | `:shared:data-local` | SQLDelight schema, DAOs, repositories (`AgendaRepository`, `FavoritesRepository`, `PrefsRepository`) | common + driver `actual`s |
 | `:shared:domain` | Overlap engine, time-slot grouping, filter/search, use cases (`ToggleFavorite`, `ObserveDay`, `ObserveMySchedule`, `ReconcileReminders`) | common, pure Kotlin |
 | `:shared:auth` | `AuthRepository` interface + Firebase implementation (GitLive), fake for tests | common + platform sign-in bridges |
@@ -283,10 +308,14 @@ Kotlin 2.x · Compose Multiplatform · Coroutines/Flow · kotlinx.serialization 
 
 ```mermaid
 flowchart LR
+  G[(Google RSVP RPC)] -.->|cron| T[":tools:agenda-sync (CI)"]
+  T --> P[(GitHub Pages agenda.json)]
   subgraph Sources
     B[Bundled JSON]:::src
-    R[Remote agenda]:::src
+    R[PublishedAgendaSource]:::src
   end
+  P --> R
+  P -.->|build time| B
   B --> N[Normalizer]
   R --> N
   N --> DB[(SQLDelight)]
@@ -350,9 +379,10 @@ flowchart TD
 - **Acceptance:** `./gradlew check` passes locally and in CI; iOS app builds from Xcode and CI.
 
 ### WS1 — Agenda data and ingestion · Size M–L
-- **Scope:** FR-DATA-1 spike + ADR; `core-model`; DTOs; normalizer; `BundledAgendaSource` with a captured snapshot; remote source; SQLDelight agenda tables; `AgendaRepository` exposing `Flow<List<ConferenceDay>>`; refresh policy; diffing (FR-DATA-5).
-- **Depends on:** WS0.
-- **Acceptance:** fresh install with no network shows the full agenda from the bundle; a refresh with changed fixture data updates the DB and emits a diff; normalizer tests cover time zone, missing fields, and ID stability.
+- **Scope (pipeline):** `:tools:agenda-sync` — RPC fetcher + Playwright fallback, `RsvpAgendaParser` with golden tests on committed raw snapshots, validation gate, thumbnailing, GitHub Pages publish, cron workflow, failure → GitHub issue (FR-DATA-2..6, 11).
+- **Scope (app):** `core-model` serializable DTOs; `BundledAgendaSource` + `syncBundledAgenda` Gradle task; `PublishedAgendaSource` (manifest → conditional fetch); SQLDelight agenda tables; `AgendaRepository` exposing `Flow<List<ConferenceDay>>`; refresh policy; diffing (FR-DATA-7..10).
+- **Depends on:** WS0. The pipeline half can start on day 1 — the source is now known and a raw snapshot exists.
+- **Acceptance:** CI job publishes a valid `agenda.json` from the live source; a deliberately corrupted fixture fails validation and does not publish; fresh install with no network shows the full agenda from the bundle; a refresh with a changed hash updates the DB in one transaction and emits a diff; an unchanged hash costs one small manifest request; parser tests cover time zone, missing fields (breaks have no speakers/code), inconsistent track names, and ID stability.
 
 ### WS2 — Domain logic · Size M
 - **Scope:** overlap engine (FR-OV-1..3, 6), time-slot grouping, favorite-conflict computation, filters and search, use cases; all pure Kotlin with fakes.
@@ -428,7 +458,9 @@ Parallelism: once WS0 is done, **WS1, WS2, WS3, and WS-AUTH can run at the same 
 
 | # | Risk / question | Impact | Mitigation / next step |
 |---|---|---|---|
-| R1 | **Agenda source format and terms of use are unknown** (the page could not be inspected while this PRD was written). It may be JS-rendered, change without notice, or forbid scraping. | High | WS1 spike first; bundled snapshot; optional self-hosted JSON mirror updated by a GitHub Action; manual JSON as a last resort. |
+| R1 | **Agenda source is a private, undocumented Google RPC** (positional arrays, API key from the JS bundle, build-label versioned). It can change without notice, and the terms of use are not stated. | High (likelihood reduced: format now known) | Only our CI talks to it (ADR-0001); Playwright fallback; validation gate before publish; golden fixtures; bundled snapshot; `agenda.override.json` manual patch; ask organizers for an official feed. |
+| R1b | Source has no rooms, levels, or speaker bios; track names are inconsistent free text. | Low | UI degrades gracefully (track as lane); resolve tracks by tag ID; render optional fields only when present. |
+| R1c | Speaker photos are huge (up to 5.5 MB, ~25 MB total). | Medium (app size, cold start) | Pipeline resizes to 256 px WebP (~15 KB each); app never loads originals. |
 | R2 | Late agenda changes during the event week | Medium | Refresh policy + diff notices; reminders reconciled on every refresh. |
 | R3 | Android exact-alarm restrictions (API 31+/34+) | Medium | `USE_EXACT_ALARM` is allowed for calendar/alarm-style apps; otherwise request `SCHEDULE_EXACT_ALARM` with an explanation; inexact fallback. |
 | R4 | iOS 64 pending-notification cap | Low | Rolling window + top-up on foreground/background refresh. |
@@ -437,7 +469,8 @@ Parallelism: once WS0 is done, **WS1, WS2, WS3, and WS-AUTH can run at the same 
 | R7 | Sign-in needs network once; conference Wi‑Fi is unreliable | Medium | Encourage sign-in before the event; clear offline messaging. |
 | R8 | GitLive Firebase SDK maturity vs native SDKs | Medium | Keep Firebase behind `AuthRepository`/`SyncRepository`; fall back to platform-native SDKs through expect/actual if needed. |
 | R9 | Firebase cost and privacy | Low | Tiny data volume (favorites only); rules deny by default; privacy policy. |
-| Q1 | Exact event dates, number of days, and venue time zone to confirm from the official site. | — | Confirm in WS1 spike. |
+| Q1 | ~~Event dates / TZ~~ **Resolved:** Wed Oct 28 – Thu Oct 29 2026, Google Bay View campus, `America/Los_Angeles`; 49 agenda items (~40 sessions, 4 tracks, 81 speakers). | — | — |
+| Q5 | The site has per-session **reservations** ("Session reservations are open"). Do we link out per session, or just to the agenda? (Managing RSVPs stays a non-goal.) | — | Default: per-session link-out if a stable session URL exists. |
 | Q2 | Is a read-only agenda preview before sign-in acceptable (FR-AU-8)? | — | Decide in design review. |
 | Q3 | Should "Keep both" acknowledged conflicts sync? (Current assumption: yes.) | — | Confirm with owner. |
 | Q4 | Desktop (JVM) target for development only, or shipped? | — | Default: dev only. |
@@ -448,7 +481,7 @@ Parallelism: once WS0 is done, **WS1, WS2, WS3, and WS-AUTH can run at the same 
 
 | User-requested feature | Requirements | Workstreams |
 |---|---|---|
-| Daily view of sessions | FR-AG-1..10, FR-DATA | WS1, WS2, WS3 |
+| Daily view of sessions | FR-AG-1..10, FR-DATA-1..11 | WS1, WS2, WS3 |
 | Identify overlapping sessions | FR-OV-1..7 | WS2, WS3 |
 | Mark sessions as favorite | FR-FV-1..6 | WS4, WS3 |
 | Reminder alert before a session | FR-RM-1..10 | WS5 |
